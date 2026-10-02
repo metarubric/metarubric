@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metarubrics-supplement"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.9", "openai>=2,<3", "pyarrow>=15", "transformers>=4.51"]
+
+[project.scripts]
+metarubrics = "metarubrics.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["verl_failure_isolation"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

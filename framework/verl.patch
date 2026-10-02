@@ -1,0 +1,563 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 268f8d5f..77fdadbd 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -979,7 +979,7 @@ class AgentLoopWorker:
+         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
+         reward_extra_keys = list(reward_extra_infos[0].keys())
+         for key in reward_extra_keys:
+-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
++            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos])
+ 
+         # Add multi_modal_inputs to non_tensor_batch if any samples have them
+         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index d1eaa7bd..95de89b2 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1382,6 +1382,12 @@ class RayPPOTrainer:
+ 
+         self.global_steps = 0
+ 
++        if bool(self.config.trainer.get("recovery_ckpt_enable", False)):
++            # Fail before any GPU work if the recovery helper or its config preconditions are missing.
++            from recovery_checkpoints import RecoveryCheckpointKeeper
++
++            RecoveryCheckpointKeeper.from_trainer_config(self.config.trainer)
++
+         # load checkpoint and update weights before doing anything
+         self._load_checkpoint()
+         self.checkpoint_manager.update_weights(self.global_steps)
+@@ -1435,10 +1441,21 @@ class RayPPOTrainer:
+                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+ 
+-                # add uid to batch
+-                batch.non_tensor_batch["uid"] = np.array(
+-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+-                )
++                # add uid to batch.
++                # AGRL patch: uid is the key GRPO groups by when computing the
++                # advantage (see compute_grpo_outcome_advantage below). If the
++                # dataset carries pair_id, honour it, so that two rows built as
++                # a counterfactual twin pair share one advantage group instead
++                # of each getting its own. Without this the line below hands
++                # every row a fresh uuid and the pairing is silently lost.
++                if "pair_id" in batch.non_tensor_batch:
++                    batch.non_tensor_batch["uid"] = np.array(
++                        [str(x) for x in batch.non_tensor_batch["pair_id"]], dtype=object
++                    )
++                else:
++                    batch.non_tensor_batch["uid"] = np.array(
++                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
++                    )
+ 
+                 gen_batch = self._get_gen_batch(batch)
+ 
+@@ -1524,12 +1541,332 @@ class RayPPOTrainer:
+                         # extract reward_tensor and reward_extra_infos_dict for training
+                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+ 
++                        # A failed external judge is missing supervision rather than a
++                        # zero-quality response. Keep the optimizer batch shape fixed,
++                        # but neutralize the complete GRPO group containing any invalid
++                        # rollout so unrelated groups can continue training.
++                        acre_dual_mode = os.environ.get("ACRE_REWARD_MODE", "").strip() == "correctness_gated_dual"
++                        if "judge_valid" in reward_extra_infos_dict and not acre_dual_mode:
++                            from verl_failure_isolation import isolate_invalid_judge_groups
++
++                            isolated_response_mask, reward_tensor, isolation = (
++                                isolate_invalid_judge_groups(
++                                    response_mask=batch.batch["response_mask"],
++                                    token_level_scores=reward_tensor,
++                                    group_ids=batch.non_tensor_batch["uid"],
++                                    judge_valid=reward_extra_infos_dict["judge_valid"],
++                                )
++                            )
++                            metrics["judge/invalid_rollouts"] = isolation.invalid_rollouts
++                            metrics["judge/invalid_groups"] = isolation.invalid_groups
++                            metrics["judge/valid_groups"] = isolation.valid_groups
++
+                     # Operating Mode Selection:
+                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
++                    acre_gold_anchor_enabled = os.environ.get(
++                        "ACRE_GOLD_ANCHOR_ENABLE", "0"
++                    ).strip() == "1"
++                    anchor_decision_only_group_ids = ()
++                    if acre_gold_anchor_enabled:
++                        if not acre_dual_mode:
++                            raise RuntimeError("gold anchors require correctness_gated_dual mode")
++                        from acre_gold_anchor import rollout_correction_is_active
++
++                        if rollout_correction_is_active(rollout_corr_config):
++                            raise RuntimeError("gold anchors do not support rollout correction")
++                        required_anchor_fields = {"label_score", "reference_label"}
++                        missing_anchor_fields = required_anchor_fields - set(reward_extra_infos_dict)
++                        if missing_anchor_fields:
++                            raise RuntimeError(
++                                f"gold anchor metadata is incomplete: {sorted(missing_anchor_fields)}"
++                            )
++                        from acre_gold_anchor import inject_gold_decision_anchors
++
++                        anchor = inject_gold_decision_anchors(
++                            response_ids=batch.batch["responses"],
++                            input_ids=batch.batch["input_ids"],
++                            response_mask=batch.batch["response_mask"],
++                            group_ids=batch.non_tensor_batch["uid"],
++                            label_scores=reward_extra_infos_dict["label_score"],
++                            reference_labels=reward_extra_infos_dict["reference_label"],
++                            tokenizer=self.tokenizer,
++                            rollout_n=self.config.actor_rollout_ref.rollout.n,
++                        )
++                        batch.batch["responses"] = anchor.response_ids
++                        batch.batch["input_ids"] = anchor.input_ids
++                        reward_extra_infos_dict["acre_original_label_score"] = list(
++                            anchor.original_label_scores
++                        )
++                        reward_extra_infos_dict["label_score"] = list(
++                            anchor.updated_label_scores
++                        )
++                        reward_extra_infos_dict["acre_gold_anchor"] = list(anchor.anchor_flags)
++                        anchor_decision_only_group_ids = anchor.decision_only_group_ids
++                        if "rollout_log_probs" in batch.batch:
++                            batch.batch.pop("rollout_log_probs")
++                        metrics.update(anchor.metrics)
++                    acre_gold_pair_enabled = os.environ.get(
++                        "ACRE_GOLD_PAIR_ENABLE", "0"
++                    ).strip() == "1"
++                    gold_pair_decision_only_group_ids = ()
++                    gold_pair_label_overrides = None
++                    if acre_gold_pair_enabled:
++                        if acre_gold_anchor_enabled:
++                            raise RuntimeError(
++                                "gold anchor and selective-pair modes are mutually exclusive"
++                            )
++                        if not acre_dual_mode:
++                            raise RuntimeError(
++                                "selective gold pairs require correctness_gated_dual mode"
++                            )
++                        from acre_gold_anchor import rollout_correction_is_active
++
++                        if rollout_correction_is_active(rollout_corr_config):
++                            raise RuntimeError(
++                                "selective gold pairs do not support rollout correction"
++                            )
++                        required_pair_fields = {"label_score", "reference_label"}
++                        missing_pair_fields = required_pair_fields - set(
++                            reward_extra_infos_dict
++                        )
++                        if missing_pair_fields:
++                            raise RuntimeError(
++                                "selective gold pair metadata is incomplete: "
++                                f"{sorted(missing_pair_fields)}"
++                            )
++                        from acre_gold_pair import inject_selective_gold_pairs
++
++                        gold_pair = inject_selective_gold_pairs(
++                            response_ids=batch.batch["responses"],
++                            input_ids=batch.batch["input_ids"],
++                            response_mask=batch.batch["response_mask"],
++                            group_ids=batch.non_tensor_batch["uid"],
++                            label_scores=reward_extra_infos_dict["label_score"],
++                            reference_labels=reward_extra_infos_dict["reference_label"],
++                            tokenizer=self.tokenizer,
++                            rollout_n=self.config.actor_rollout_ref.rollout.n,
++                        )
++                        batch.batch["responses"] = gold_pair.response_ids
++                        batch.batch["input_ids"] = gold_pair.input_ids
++                        reward_extra_infos_dict["acre_original_label_score"] = list(
++                            gold_pair.original_label_scores
++                        )
++                        reward_extra_infos_dict["label_score"] = list(
++                            gold_pair.updated_label_scores
++                        )
++                        reward_extra_infos_dict["acre_original_decision"] = list(
++                            gold_pair.original_decisions
++                        )
++                        reward_extra_infos_dict["acre_gold_pair_positive"] = list(
++                            gold_pair.positive_flags
++                        )
++                        reward_extra_infos_dict["acre_gold_pair_negative"] = list(
++                            gold_pair.negative_flags
++                        )
++                        reward_extra_infos_dict["acre_gold_pair_status"] = list(
++                            gold_pair.pair_statuses
++                        )
++                        reward_extra_infos_dict["acre_gold_pair_preferred_contrast"] = list(
++                            gold_pair.preferred_contrasts
++                        )
++                        reward_extra_infos_dict["acre_pairwise_label_advantage"] = list(
++                            gold_pair.label_advantage_overrides
++                        )
++                        gold_pair_decision_only_group_ids = (
++                            gold_pair.decision_only_group_ids
++                        )
++                        gold_pair_label_overrides = gold_pair.label_advantage_overrides
++                        if "rollout_log_probs" in batch.batch:
++                            batch.batch.pop("rollout_log_probs")
++                        metrics.update(gold_pair.metrics)
++                    anchor_decision_only_group_ids = (
++                        *anchor_decision_only_group_ids,
++                        *gold_pair_decision_only_group_ids,
++                    )
++                    acre_gold_bootstrap_enabled = os.environ.get(
++                        "ACRE_GOLD_BOOTSTRAP_ENABLE", "0"
++                    ).strip() == "1"
++                    gold_bootstrap_decision_only_group_ids = ()
++                    gold_bootstrap_positive_only_group_ids = ()
++                    gold_bootstrap_label_overrides = None
++                    if acre_gold_bootstrap_enabled:
++                        if acre_gold_anchor_enabled or acre_gold_pair_enabled:
++                            raise RuntimeError(
++                                "positive bootstrap mode is mutually exclusive with "
++                                "gold anchor and selective-pair modes"
++                            )
++                        if not acre_dual_mode:
++                            raise RuntimeError(
++                                "positive gold bootstraps require correctness_gated_dual mode"
++                            )
++                        from acre_gold_anchor import rollout_correction_is_active
++
++                        if rollout_correction_is_active(rollout_corr_config):
++                            raise RuntimeError(
++                                "positive gold bootstraps do not support rollout correction"
++                            )
++                        required_bootstrap_fields = {"label_score", "reference_label"}
++                        missing_bootstrap_fields = required_bootstrap_fields - set(
++                            reward_extra_infos_dict
++                        )
++                        if missing_bootstrap_fields:
++                            raise RuntimeError(
++                                "positive gold bootstrap metadata is incomplete: "
++                                f"{sorted(missing_bootstrap_fields)}"
++                            )
++                        from acre_gold_bootstrap import inject_positive_gold_bootstraps
++
++                        gold_bootstrap = inject_positive_gold_bootstraps(
++                            response_ids=batch.batch["responses"],
++                            input_ids=batch.batch["input_ids"],
++                            response_mask=batch.batch["response_mask"],
++                            group_ids=batch.non_tensor_batch["uid"],
++                            label_scores=reward_extra_infos_dict["label_score"],
++                            reference_labels=reward_extra_infos_dict["reference_label"],
++                            tokenizer=self.tokenizer,
++                            rollout_n=self.config.actor_rollout_ref.rollout.n,
++                        )
++                        batch.batch["responses"] = gold_bootstrap.response_ids
++                        batch.batch["input_ids"] = gold_bootstrap.input_ids
++                        reward_extra_infos_dict["acre_original_label_score"] = list(
++                            gold_bootstrap.original_label_scores
++                        )
++                        reward_extra_infos_dict["label_score"] = list(
++                            gold_bootstrap.updated_label_scores
++                        )
++                        reward_extra_infos_dict["acre_original_decision"] = list(
++                            gold_bootstrap.original_decisions
++                        )
++                        reward_extra_infos_dict["acre_gold_bootstrap"] = list(
++                            gold_bootstrap.positive_flags
++                        )
++                        reward_extra_infos_dict["acre_gold_bootstrap_status"] = list(
++                            gold_bootstrap.bootstrap_statuses
++                        )
++                        reward_extra_infos_dict["acre_positive_only_label_advantage"] = list(
++                            gold_bootstrap.label_advantage_overrides
++                        )
++                        gold_bootstrap_decision_only_group_ids = (
++                            gold_bootstrap.decision_only_group_ids
++                        )
++                        gold_bootstrap_positive_only_group_ids = (
++                            gold_bootstrap.positive_only_group_ids
++                        )
++                        gold_bootstrap_label_overrides = (
++                            gold_bootstrap.label_advantage_overrides
++                        )
++                        if "rollout_log_probs" in batch.batch:
++                            batch.batch.pop("rollout_log_probs")
++                        metrics.update(gold_bootstrap.metrics)
++                    anchor_decision_only_group_ids = (
++                        *anchor_decision_only_group_ids,
++                        *gold_bootstrap_decision_only_group_ids,
++                    )
++                    acre_label_advantage_overrides = (
++                        gold_bootstrap_label_overrides
++                        if gold_bootstrap_label_overrides is not None
++                        else gold_pair_label_overrides
++                    )
++                    acre_source_bootstrap_enabled = os.environ.get(
++                        "ACRE_SOURCE_BOOTSTRAP_ENABLE", "0"
++                    ).strip() == "1"
++                    source_bootstrap_decision_only_group_ids = ()
++                    source_bootstrap_positive_only_group_ids = ()
++                    source_bootstrap_label_overrides = None
++                    if acre_source_bootstrap_enabled:
++                        if (
++                            acre_gold_anchor_enabled
++                            or acre_gold_pair_enabled
++                            or acre_gold_bootstrap_enabled
++                        ):
++                            raise RuntimeError(
++                                "source bootstrap mode is mutually exclusive with gold "
++                                "anchor, selective-pair, and positive bootstrap modes"
++                            )
++                        if not acre_dual_mode:
++                            raise RuntimeError(
++                                "source bootstraps require correctness_gated_dual mode"
++                            )
++                        from acre_gold_anchor import rollout_correction_is_active
++
++                        if rollout_correction_is_active(rollout_corr_config):
++                            raise RuntimeError(
++                                "source bootstraps do not support rollout correction"
++                            )
++                        required_source_fields = {"label_score", "reference_label"}
++                        missing_source_fields = required_source_fields - set(
++                            reward_extra_infos_dict
++                        )
++                        if missing_source_fields:
++                            raise RuntimeError(
++                                "source bootstrap metadata is incomplete: "
++                                f"{sorted(missing_source_fields)}"
++                            )
++                        from acre_source_bootstrap import inject_source_constrained_bootstraps
++
++                        source_bootstrap = inject_source_constrained_bootstraps(
++                            response_ids=batch.batch["responses"],
++                            input_ids=batch.batch["input_ids"],
++                            response_mask=batch.batch["response_mask"],
++                            group_ids=batch.non_tensor_batch["uid"],
++                            label_scores=reward_extra_infos_dict["label_score"],
++                            reference_labels=reward_extra_infos_dict["reference_label"],
++                            tokenizer=self.tokenizer,
++                            rollout_n=self.config.actor_rollout_ref.rollout.n,
++                        )
++                        batch.batch["responses"] = source_bootstrap.response_ids
++                        batch.batch["input_ids"] = source_bootstrap.input_ids
++                        reward_extra_infos_dict["acre_original_label_score"] = list(
++                            source_bootstrap.original_label_scores
++                        )
++                        reward_extra_infos_dict["label_score"] = list(
++                            source_bootstrap.updated_label_scores
++                        )
++                        reward_extra_infos_dict["acre_original_decision"] = list(
++                            source_bootstrap.original_decisions
++                        )
++                        reward_extra_infos_dict["acre_source_bootstrap"] = list(
++                            source_bootstrap.positive_flags
++                        )
++                        reward_extra_infos_dict["acre_source_bootstrap_status"] = list(
++                            source_bootstrap.source_statuses
++                        )
++                        reward_extra_infos_dict["acre_source_bootstrap_preferred_source"] = list(
++                            source_bootstrap.preferred_sources
++                        )
++                        reward_extra_infos_dict[
++                            "acre_source_positive_label_advantage"
++                        ] = list(source_bootstrap.label_advantage_overrides)
++                        source_bootstrap_decision_only_group_ids = (
++                            source_bootstrap.decision_only_group_ids
++                        )
++                        source_bootstrap_positive_only_group_ids = (
++                            source_bootstrap.positive_only_group_ids
++                        )
++                        source_bootstrap_label_overrides = (
++                            source_bootstrap.label_advantage_overrides
++                        )
++                        if "rollout_log_probs" in batch.batch:
++                            batch.batch.pop("rollout_log_probs")
++                        metrics.update(source_bootstrap.metrics)
++                    anchor_decision_only_group_ids = (
++                        *anchor_decision_only_group_ids,
++                        *source_bootstrap_decision_only_group_ids,
++                    )
++                    acre_positive_only_group_ids = (
++                        source_bootstrap_positive_only_group_ids
++                        if acre_source_bootstrap_enabled
++                        else gold_bootstrap_positive_only_group_ids
++                    )
++                    acre_label_advantage_overrides = (
++                        source_bootstrap_label_overrides
++                        if source_bootstrap_label_overrides is not None
++                        else acre_label_advantage_overrides
++                    )
+                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+ 
+@@ -1588,6 +1925,22 @@ class RayPPOTrainer:
+                     with marked_timer("adv", timing_raw, color="brown"):
+                         # we combine with rule-based rm
+                         reward_extra_infos_dict: dict[str, list]
++                        if "judge_valid" in reward_extra_infos_dict and not acre_dual_mode:
++                            batch.batch["response_mask"] = isolated_response_mask
++                        acre_mask_gated_groups = os.environ.get("ACRE_MASK_GATED_GROUPS", "0").strip() == "1"
++                        if acre_mask_gated_groups and "joint_gated" in reward_extra_infos_dict and not acre_dual_mode:
++                            from verl_failure_isolation import isolate_gated_groups
++
++                            gated_response_mask, reward_tensor, gate_isolation = isolate_gated_groups(
++                                response_mask=batch.batch["response_mask"],
++                                token_level_scores=reward_tensor,
++                                group_ids=batch.non_tensor_batch["uid"],
++                                joint_gated=reward_extra_infos_dict["joint_gated"],
++                            )
++                            batch.batch["response_mask"] = gated_response_mask
++                            metrics["gate/masked_rollouts"] = gate_isolation.invalid_rollouts
++                            metrics["gate/masked_groups"] = gate_isolation.invalid_groups
++                            metrics["gate/kept_groups"] = gate_isolation.valid_groups
+                         batch.batch["token_level_scores"] = reward_tensor
+ 
+                         if reward_extra_infos_dict:
+@@ -1622,15 +1975,68 @@ class RayPPOTrainer:
+                             "norm_adv_by_std_in_grpo", True
+                         )  # GRPO adv normalization factor
+ 
+-                        batch = compute_advantage(
+-                            batch,
+-                            adv_estimator=self.config.algorithm.adv_estimator,
+-                            gamma=self.config.algorithm.gamma,
+-                            lam=self.config.algorithm.lam,
+-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+-                            config=self.config.algorithm,
+-                        )
++                        if acre_dual_mode:
++                            from acre_dual_advantage import build_dual_advantages
++
++                            required_dual_fields = {
++                                "label_score",
++                                "rubric_advantage",
++                                "rubric_valid",
++                            }
++                            missing_dual_fields = required_dual_fields - set(reward_extra_infos_dict)
++                            if missing_dual_fields:
++                                raise RuntimeError(
++                                    f"ACRE-v2 reward metadata is incomplete: {sorted(missing_dual_fields)}"
++                                )
++                            dual = build_dual_advantages(
++                                response_ids=batch.batch["responses"],
++                                response_mask=batch.batch["response_mask"],
++                                group_ids=batch.non_tensor_batch["uid"],
++                                label_scores=reward_extra_infos_dict["label_score"],
++                                rubric_scores=reward_extra_infos_dict["rubric_advantage"],
++                                rubric_valid=reward_extra_infos_dict["rubric_valid"],
++                                tokenizer=self.tokenizer,
++                                rubric_beta=float(os.environ.get("ACRE_RUBRIC_BETA", "0.25")),
++                                label_scope=os.environ.get(
++                                    "ACRE_LABEL_ADVANTAGE_SCOPE", "decision"
++                                ).strip(),
++                                all_wrong_penalty_mass=float(
++                                    os.environ.get("ACRE_ALL_WRONG_PENALTY_MASS", "0")
++                                ),
++                                decision_only_group_ids=anchor_decision_only_group_ids,
++                                positive_only_group_ids=acre_positive_only_group_ids,
++                                label_advantage_overrides=acre_label_advantage_overrides,
++                            )
++                            batch.batch["advantages"] = dual.advantages
++                            batch.batch["returns"] = dual.returns
++                            batch.batch["acre_label_advantages"] = dual.label_advantages
++                            batch.batch["acre_rubric_advantages"] = dual.rubric_advantages
++                            batch.batch["acre_answer_mask"] = dual.answer_mask
++                            batch.batch["acre_rationale_mask"] = dual.rationale_mask
++                            label_global_count = float((dual.label_advantages != 0).sum().item())
++                            rubric_global_count = float((dual.rubric_advantages != 0).sum().item())
++                            count_shape = (dual.advantages.shape[0],)
++                            count_options = {
++                                "device": dual.advantages.device,
++                                "dtype": dual.advantages.dtype,
++                            }
++                            batch.batch["acre_label_global_count"] = torch.full(
++                                count_shape, label_global_count, **count_options
++                            )
++                            batch.batch["acre_rubric_global_count"] = torch.full(
++                                count_shape, rubric_global_count, **count_options
++                            )
++                            metrics.update(dual.metrics)
++                        else:
++                            batch = compute_advantage(
++                                batch,
++                                adv_estimator=self.config.algorithm.adv_estimator,
++                                gamma=self.config.algorithm.gamma,
++                                lam=self.config.algorithm.lam,
++                                num_repeat=self.config.actor_rollout_ref.rollout.n,
++                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
++                                config=self.config.algorithm,
++                            )
+ 
+                     # update critic
+                     if self.use_critic:
+@@ -1660,15 +2066,37 @@ class RayPPOTrainer:
+                         # 2. It's the last training step.
+                         # 3. The current step number is a multiple of the save frequency.
+                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+-                        if self.config.trainer.save_freq > 0 and (
++                        canonical_save = self.config.trainer.save_freq > 0 and (
+                             is_last_step
+                             or self.global_steps % self.config.trainer.save_freq == 0
+                             or esi_close_to_expiration
+-                        ):
++                        )
++                        # Section 2 recovery checkpoints (opt-in via +trainer.recovery_ckpt_enable=True,
++                        # default off = legacy behavior). Extra saves between canonical ones; the helper
++                        # module (experiments/section2_vacuous_credit/recovery_checkpoints.py, on
++                        # PYTHONPATH) validates, marks and prunes only the saves it owns.
++                        recovery_enabled = bool(self.config.trainer.get("recovery_ckpt_enable", False))
++                        recovery_freq = int(self.config.trainer.get("recovery_ckpt_freq", 5))
++                        recovery_save = (
++                            recovery_enabled
++                            and not canonical_save
++                            and recovery_freq > 0
++                            and self.global_steps % recovery_freq == 0
++                        )
++                        if canonical_save or recovery_save:
+                             if esi_close_to_expiration:
+                                 print("Force saving checkpoint: ESI instance expiration approaching.")
+                             with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                 self._save_checkpoint()
++                            if recovery_enabled:
++                                # Runs only after _save_checkpoint returned; a failed save never prunes.
++                                from recovery_checkpoints import RecoveryCheckpointKeeper
++
++                                RecoveryCheckpointKeeper.from_trainer_config(self.config.trainer).after_save(
++                                    step=self.global_steps,
++                                    canonical=bool(canonical_save),
++                                    total_steps=self.total_training_steps,
++                                )
+ 
+                         # update weights from trainer to rollout
+                         with marked_timer("update_weights", timing_raw, color="red"):
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 2c66c6a3..1e2b0c97 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -758,7 +758,9 @@ class FSDPEngine(BaseEngine):
+         Save FSDP checkpoint, handling parameter offload as needed.
+         """
+         origin_module_device = next(self.module.parameters()).device.type
+-        if self._is_offload_param or origin_module_device == "cpu":
++        if (self._is_offload_param or origin_module_device == "cpu") and not getattr(
++            self, "_uses_fsdp2_cpu_offload_policy", False
++        ):
+             load_fsdp_model_to_gpu(self.module)
+ 
+         self.checkpoint_manager.save_checkpoint(
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index bf379b49..a0577e2d 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -581,7 +581,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
+                 )
+             else:
+-                self.loss_fn = partial(ppo_loss, config=actor_config)
++                if os.environ.get("ACRE_REWARD_MODE", "").strip() == "correctness_gated_dual":
++                    from acre_dual_ppo_loss import acre_dual_ppo_loss
++
++                    self.loss_fn = partial(acre_dual_ppo_loss, config=actor_config)
++                else:
++                    self.loss_fn = partial(ppo_loss, config=actor_config)
+             self.actor = TrainingWorker(config=actor_training_config)
+             self.actor.reset()
+             self.actor.set_loss_fn(self.loss_fn)
