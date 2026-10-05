@@ -1,6 +1,12 @@
-# MetaRubrics supplementary code
+# MetaRubric: Learning to Reward for Rubric-Based Reinforcement Learning
 
-This anonymous package contains MetaRubrics and the complete integrated verl source. The experiment configuration is Qwen3-4B-Instruct-2507 on HealthBench with thinking disabled.
+**Authors:** Yuxuan Fan and Jaehong Yoon (corresponding author)
+
+**Affiliation:** Nanyang Technological University, Singapore
+
+[Paper (arXiv:2610.02824)](https://arxiv.org/abs/2610.02824) · [Project page](https://metarubric.github.io)
+
+This repository contains the code for MetaRubric and the complete integrated verl source. The experiment configuration is Qwen3-4B-Instruct-2507 on HealthBench with thinking disabled.
 
 - `vendor/verl/`: full verl source, including the applied training integration, workers, configuration, tests, and upstream documentation.
 - `src/metarubrics/`: rubric revisions, weight updates, immutable snapshots, and the training reward hook.
