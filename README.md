@@ -76,3 +76,19 @@ python -m compileall -q src evaluator scripts
 ```
 
 The tests use synthetic fixtures and mocks, without model-service or GPU calls.
+
+## Citation
+
+Paper: [arXiv:2610.02824](https://arxiv.org/abs/2610.02824). Download [citation.bib](citation.bib).
+
+```bibtex
+@misc{fan2026metarubric,
+  title = {MetaRubric: Learning to Reward for Rubric-Based Reinforcement Learning},
+  author = {Fan, Yuxuan and Yoon, Jaehong},
+  year = {2026},
+  eprint = {2610.02824},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.AI},
+  url = {https://arxiv.org/abs/2610.02824}
+}
+```
